@@ -1,0 +1,10 @@
+# 明文密码，绝对不要提交
+config.py
+cookies.json
+
+watch_state.json
+watch.log
+watch.out
+watch.err
+*.png
+__pycache__/
