@@ -837,7 +837,10 @@ def main():
                 check_once(state, alert=not args.status,
                            verbose=args.status and cycle == 1,
                            allow_reserve=daemon)
-                save_state(state)
+                if WEBHOOK_FAILED:
+                    log("   ↩️  推送失败，本轮状态不落盘 —— 下一轮会重新报这个空位")
+                else:
+                    save_state(state)
                 if fails >= MAX_SILENT_FAILURES:
                     notify(f"✅ {tracks_label()} 盯梢已恢复",
                            f"连续失败 {fails} 轮后恢复正常，继续盯梢中")
@@ -872,7 +875,8 @@ def main():
     except KeyboardInterrupt:
         log("👋 停止盯梢")
     finally:
-        save_state(state)
+        if not WEBHOOK_FAILED:
+            save_state(state)
 
 
 if __name__ == "__main__":
