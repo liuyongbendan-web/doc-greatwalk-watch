@@ -72,7 +72,8 @@ PID_FILE = os.path.join(HERE, "watch.pid")
 # 否则一次性查询和守护进程启动撞车时，守护进程会误判成"已有实例"而自杀。
 ONE_SHOT_FLAGS = ("--once", "--status", "--table", "--health", "--watchdog", "--test-notify")
 
-MAX_SILENT_FAILURES = 3     # 连续这么多轮取数失败就报警（不能让它默默死掉）
+MAX_SILENT_FAILURES = 3
+WEBHOOK_FAILED = False   # 推送失败过吗 —— CI 里要据此返回非零退出码     # 连续这么多轮取数失败就报警（不能让它默默死掉）
 
 def watched_tracks():
     """TRACK 可以是一条（字符串）或多条（列表）"""
@@ -340,8 +341,23 @@ def fetch_all(needed):
 
 # ── 报警 ─────────────────────────────────────────────────────
 
+def normalize_hook(hook):
+    """
+    容错：只填了 ntfy 主题名（没有 https://）时自动补全。
+    urllib 遇到没有 scheme 的地址会抛 "unknown url type"，
+    2026-09-25 云端首跑就是栽在这里 —— 票查到了却发不出去。
+    """
+    hook = (hook or "").strip()
+    if not hook:
+        return ""
+    if "://" not in hook:
+        return "https://ntfy.sh/" + hook.lstrip("/")
+    return hook
+
+
 def send_webhook(hook, title, body, url, track=None):
     """自动适配 ntfy / Discord / Slack / 通用 JSON 四种格式"""
+    hook = normalize_hook(hook)
     full = (f"{body}\n\n{url}\n"
             f"手机上：选 {track or tracks_label()} → 选日期 → 点绿色格子 → Reserve\n"
             f"（Reserve 后购物车锁约 15 分钟，不必抢着付款）")
@@ -393,6 +409,7 @@ def notify(title, body, url=None, track=None):
             log("   webhook 已发送")
         except Exception as e:
             log(f"   ⚠️ webhook 失败: {e}")
+            globals()["WEBHOOK_FAILED"] = True
     if wc.OPEN_BROWSER and sys.platform == "darwin":
         subprocess.run(["open", url or BOOKING_URL], capture_output=True)
 
@@ -845,6 +862,9 @@ def main():
                        f"命令：cd {HERE} && python3 watch.py --health")
 
             if args.once or args.status:
+                if args.once and WEBHOOK_FAILED:
+                    log("❌ 查到了空位但推送没发出去 —— 这次等于白跑，用非零退出码让工作流变红")
+                    sys.exit(2)
                 break
             nap = wc.POLL_SECONDS * random.uniform(0.75, 1.25)
             log(f"   💤 {nap/60:.1f} 分钟后再查")
