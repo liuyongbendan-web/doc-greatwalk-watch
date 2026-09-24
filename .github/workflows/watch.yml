@@ -1,0 +1,48 @@
+name: DOC Great Walk availability watch
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub may delay scheduled runs by 5-20 min at peak.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: gw-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Cache watch_state.json so the same vacancy is not pushed every 15 min.
+      - name: Restore previous state
+        uses: actions/cache@v4
+        with:
+          path: watch_state.json
+          key: gw-state-${{ github.run_id }}
+          restore-keys: gw-state-
+
+      - name: Check availability
+        env:
+          GW_WEBHOOK_URL: ${{ secrets.GW_WEBHOOK_URL }}
+          GW_TRACK: "Milford Track,Routeburn Track"
+          GW_DATE_RANGE: "2027-02-10,2027-04-30"
+          GW_PEOPLE: "1"
+        run: |
+          if [ -z "$GW_WEBHOOK_URL" ]; then
+            echo "::error::Repository secret GW_WEBHOOK_URL is not set."
+            echo "::error::Without it a vacancy can be found but never reach your phone."
+            echo "::error::Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          python3 watch.py --once
