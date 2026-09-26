@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 
 import tracks
 import watch_config as wc
+import watchlist
 
 # 环境变量覆盖（给 GitHub Actions / 云端 cron 用，不必改配置文件）
 def _env(*names):
@@ -76,22 +77,30 @@ MAX_SILENT_FAILURES = 3
 WEBHOOK_FAILED = False   # 推送失败过吗 —— CI 里要据此返回非零退出码     # 连续这么多轮取数失败就报警（不能让它默默死掉）
 
 def watched_tracks():
-    """TRACK 可以是一条（字符串）或多条（列表）"""
-    raw = wc.TRACK
-    names = [raw] if isinstance(raw, str) else list(raw)
-    return [tracks.resolve_name(n) for n in names]
+    """清单里启用中的线路（去重、保序）"""
+    seen = []
+    for e in watchlist.active():
+        if e["track"] not in seen:
+            seen.append(e["track"])
+    return seen
 
 
 def track_info(name=None):
-    return tracks.get(name or watched_tracks()[0])
+    ts = watched_tracks()
+    return tracks.get(name or (ts[0] if ts else "Milford Track"))
 
 
 def track_name(name=None):
-    return tracks.resolve_name(name) if name else watched_tracks()[0]
+    if name:
+        return tracks.resolve_name(name)
+    ts = watched_tracks()
+    return ts[0] if ts else "（清单为空）"
 
 
 def tracks_label():
     ts = watched_tracks()
+    if not ts:
+        return "（清单为空）"
     return " + ".join(ts) if len(ts) <= 3 else f"{len(ts)} 条线路"
 
 
@@ -211,22 +220,27 @@ def watcher_pids():
     return [p] if p else []
 
 
-def start_dates():
-    """配置里的区间 + 单点，合并去重排序"""
-    out = set(wc.WATCH_START_DATES)
-    rng = getattr(wc, "WATCH_DATE_RANGE", None)
-    if rng:
-        a = datetime.strptime(rng[0], "%Y-%m-%d")
-        b = datetime.strptime(rng[1], "%Y-%m-%d")
-        while a <= b:
-            out.add(a.strftime("%Y-%m-%d"))
-            a += timedelta(days=1)
-    return sorted(out)
+def entry_dates(entry):
+    """一条清单条目的全部出发日（含首尾）"""
+    a = datetime.strptime(entry["from"], "%Y-%m-%d")
+    b = datetime.strptime(entry["to"], "%Y-%m-%d")
+    out = []
+    while a <= b:
+        out.append(a.strftime("%Y-%m-%d"))
+        a += timedelta(days=1)
+    return out
 
 
-def watched_huts(track):
-    """MODE='any' 时要盯的住宿点；HUTS_FILTER 留空则盯该线路全部"""
+def all_start_dates():
+    ds = sorted({d for e in watchlist.active() for d in entry_dates(e)})
+    return ds
+
+
+def watched_huts(track, entry=None):
+    """任意空位模式要盯的住宿点。条目勾了「只要小屋」就排除营地"""
     all_huts = track_info(track)["huts"]
+    if entry and entry.get("huts_only"):
+        return [h for h in all_huts if "hut" in h.lower()] or all_huts
     f = cfg_for(track, "HUTS_FILTER", []) or []
     if not f:
         return all_huts
@@ -244,26 +258,33 @@ def itinerary_for(track):
     return itin
 
 
-def targets():
+def targets(entries=None):
     """
-    返回 [(线路, 标签, [(住宿点, 日期), ...]), ...]。组内全部有位 = 「整组命中」。
-      MODE='itinerary' : 一组 = 一个出发日的连住行程
-      MODE='any'       : 一组 = 一个 (住宿点, 日期)
+    返回 [(线路, 标签, [(住宿点, 日期), ...], 条目), ...]。组内全部有位 = 「整组命中」。
+      连住线路（Milford/Routeburn/...）: 一组 = 一个出发日的连住行程
+      其余线路                        : 一组 = 一个 (住宿点, 日期)
     """
     out = []
-    for track in watched_tracks():
-        mode = cfg_for(track, "MODE", "itinerary")
-        if mode == "itinerary":
+    for e in (entries if entries is not None else watchlist.active()):
+        track = e["track"]
+        if watchlist.mode_for(track) == "itinerary":
             itin = itinerary_for(track)
-            for sd in start_dates():
+            for sd in entry_dates(e):
                 d0 = datetime.strptime(sd, "%Y-%m-%d")
                 out.append((track, sd,
                             [(hut, (d0 + timedelta(days=i)).strftime("%Y-%m-%d"))
-                             for i, hut in enumerate(itin)]))
+                             for i, hut in enumerate(itin)], e))
         else:
-            out += [(track, f"{hut} {d}", [(hut, d)])
-                    for d in start_dates() for hut in watched_huts(track)]
+            out += [(track, f"{hut} {d}", [(hut, d)], e)
+                    for d in entry_dates(e) for hut in watched_huts(track, e)]
     return out
+
+
+def needed_dates(tgts):
+    need = {}
+    for track, _, legs, _ in tgts:
+        need.setdefault(track, set()).update(d for _, d in legs)
+    return need
 
 
 def windows(all_dates):
@@ -476,28 +497,29 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
     """allow_reserve 只有常驻循环才传 True。
     --once / --status / --table 是人工查询或 CI 巡检，绝不能顺手下单。"""
     tgts = targets()
-    needed = {}
-    for track, _, legs in tgts:
-        needed.setdefault(track, set()).update(d for _, d in legs)
-    grid, nreq = fetch_all(needed)
+    if not tgts:
+        log("   清单为空（或全部停用），本轮无事可做")
+        return False
+    grid, nreq = fetch_all(needed_dates(tgts))
 
     now = time.time()
     counts, last_alert = state["counts"], state["last_alert"]
-    hits_by_track = {}                 # 线路 -> [(标签, 住宿点, 日期, 余量, 整组命中)]
+    hits_by_track = {}                 # 线路 -> [(标签, 住宿点, 日期, 余量, 整组命中, 条目)]
     interesting_lines = []
     seen_keys = set()                  # 同一个 hut-night 一轮只报一次
     n_open = n_closed = 0
     multi = len(watched_tracks()) > 1
 
-    for track, label, legs in tgts:
+    for track, label, legs, entry in tgts:
         leg_state = [(h, d, grid.get((track, h, d), "?")) for h, d in legs]
         for _, _, n in leg_state:
             if n is None:
                 n_closed += 1
             else:
                 n_open += 1
+        people = entry.get("people", 1)
         avail = [(h, d, n) for h, d, n in leg_state
-                 if isinstance(n, int) and n >= wc.PEOPLE]
+                 if isinstance(n, int) and n >= people]
         full = len(avail) == len(legs)
 
         if avail or verbose:
@@ -520,7 +542,7 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
             fresh = prev in (None, 0) or (isinstance(prev, int) and n > prev)
             cooled = now - last_alert.get(key, 0) > wc.REALERT_MINUTES * 60
             if fresh or cooled:
-                hits_by_track.setdefault(track, []).append((label, h, d, n, full))
+                hits_by_track.setdefault(track, []).append((label, h, d, n, full, entry))
                 seen_keys.add(key)
                 last_alert[key] = now
 
@@ -535,36 +557,34 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
     # 每条线路单独发一条通知，标题里就带线路名，不会混在一起
     for track, hits in hits_by_track.items():
         full_hit = any(x[4] for x in hits)
-        itinerary_mode = cfg_for(track, "MODE", "itinerary") == "itinerary"
+        itinerary_mode = watchlist.mode_for(track) == "itinerary"
         title = (f"🎉 {track} 整条行程有票！" if full_hit and itinerary_mode
                  else f"✨ {track} 有空位")
-        notify(title, summarize_hits(hits, itinerary_mode), track=track)
+        notify(title, summarize_hits([x[:5] for x in hits], itinerary_mode), track=track)
 
-        if full_hit and wc.AUTO_RESERVE and allow_reserve and itinerary_mode:
-            # 只抢你真会去的日期；范围外的照样报警，但不下单
-            rng = getattr(wc, "AUTO_RESERVE_DATE_RANGE", None)
-            only = getattr(wc, "AUTO_RESERVE_TRACKS", None)
-            if only and track not in [tracks.resolve_name(t) for t in only]:
-                log(f"   ⏭  {track} 不在自动占位线路名单内，只报警不下单")
-                continue
-            bookable = [x[0] for x in hits if x[4]
-                        and (not rng or rng[0] <= x[0] <= rng[1])]
-            if bookable:
-                auto_reserve(track, bookable[0])
-            elif rng:
-                log(f"   ⏭  {track} 命中的出发日不在自动占位范围 "
-                    f"{rng[0]}~{rng[1]} 内，只报警不下单")
+        # 自动占位：总开关（本机 AUTO_RESERVE，云端强制关）+ 该条目自己的开关
+        if not (full_hit and wc.AUTO_RESERVE and allow_reserve and itinerary_mode):
+            continue
+        armed = [x for x in hits if x[4] and x[5].get("auto_reserve")]
+        if armed:
+            first = armed[0]
+            auto_reserve(track, first[0], first[5].get("people", 1))
+        else:
+            log(f"   ⏭  {track} 命中的条目没开自动占位，只报警不下单")
     return bool(hits_by_track)
 
 
 def print_table():
     """打印每条线路的整段日期 × 住宿点余量总表"""
     tgts = targets()
-    needed = {}
-    for track, _, legs in tgts:
-        needed.setdefault(track, set()).update(d for _, d in legs)
-    grid, nreq = fetch_all(needed)
+    if not tgts:
+        log("清单为空（或全部停用）")
+        return
+    grid, nreq = fetch_all(needed_dates(tgts))
     log(f"{tracks_label()} | {nreq} 次请求，{len(grid)} 个格子")
+    min_people = {}
+    for t, _, _, e in tgts:
+        min_people[t] = min(min_people.get(t, 99), e.get("people", 1))
 
     for track in watched_tracks():
         sub = {(h, d): v for (t, h, d), v in grid.items() if t == track}
@@ -598,7 +618,7 @@ def print_table():
                     txt = "?"
                 else:
                     txt = str(v)
-                    if v >= wc.PEOPLE:
+                    if v >= min_people.get(track, 1):
                         hot = True
                 cells.append(f" {txt:>{w[i]}}")
             print(f"  {d:<12}" + "".join(cells) + ("  ⬅ 有位" if hot else ""))
@@ -617,7 +637,7 @@ async def hold_browser_open(minutes=30):
         await asyncio.sleep(minutes * 60)
 
 
-def auto_reserve(track, start_date):
+def auto_reserve(track, start_date, people=1):
     log(f"🤖 AUTO_RESERVE: 尝试占位 {track} {start_date} ...")
     try:
         import asyncio
@@ -630,7 +650,7 @@ def auto_reserve(track, start_date):
     itin = itinerary_for(track)
     config.GREAT_WALK = track
     config.START_DATE = start_date
-    config.NUM_PEOPLE = wc.PEOPLE
+    config.NUM_PEOPLE = people
     config.NUM_NIGHTS = len(itin)
 
     async def run():
@@ -683,6 +703,58 @@ def auto_reserve(track, start_date):
 
 
 # ── 主循环 ───────────────────────────────────────────────────
+
+_WAKE = False
+
+
+def _on_wake(signum, frame):
+    """收到 SIGUSR1：界面刚保存了清单，提前结束本轮睡眠。
+    不打断正在进行的事（比如自动占位开着浏览器等你付款）。"""
+    global _WAKE
+    _WAKE = True
+
+
+def interruptible_sleep(seconds):
+    """查询途中收到的叫醒不能丢：那一轮用的还是旧清单，醒来要立刻再查"""
+    global _WAKE
+    end = time.time() + seconds
+    while time.time() < end:
+        if _WAKE:
+            _WAKE = False
+            log("   ⏰ 被界面叫醒，立即按新清单检查")
+            return
+        time.sleep(1)
+
+
+def watchlist_signature():
+    """清单内容指纹 —— 常驻循环每轮比对，界面改了就在日志里说一声并立即生效"""
+    try:
+        import hashlib
+        return hashlib.md5(json.dumps(watchlist.load()["entries"], sort_keys=True,
+                                      ensure_ascii=False).encode()).hexdigest()
+    except Exception:
+        return ""
+
+
+def describe_watchlist():
+    act = watchlist.active()
+    if not act:
+        log("🎯 关注清单为空（或全部停用）—— 盯梢空转中，去界面里加一条")
+        return
+    log(f"🎯 盯梢 {len(act)} 条关注：")
+    for e in act:
+        t = e["track"]
+        if watchlist.mode_for(t) == "itinerary":
+            what = " → ".join(itinerary_for(t))
+        else:
+            what = f"任意空位（{len(watched_huts(t, e))} 个住宿点）"
+        flag = "  🤖自动占位" if (e.get("auto_reserve") and wc.AUTO_RESERVE) else ""
+        log(f"   • {t}  {e['from']} ~ {e['to']}  {e.get('people',1)} 人  | {what}{flag}")
+    tg = targets(act)
+    nreq = sum(len(windows(v)) for v in needed_dates(tg).values())
+    log(f"   模式: {'整条齐了才叫' if wc.REQUIRE_FULL_ITINERARY else '任意一晚有空就叫'}"
+        f" | 间隔 {wc.POLL_SECONDS}s | 每轮 {nreq} 次请求")
+
 
 def ensure_single_instance():
     """只允许一个常驻盯梢进程。撞车就安静退出（退出码 0，这样 launchd 的
@@ -812,26 +884,26 @@ def main():
     if not (args.once or args.status):
         ensure_single_instance()
 
+    if not (args.once or args.status):
+        import signal
+        signal.signal(signal.SIGUSR1, _on_wake)
+
     state = load_state()
-    sds = start_dates()
     log("=" * 62)
-    for t in watched_tracks():
-        m = cfg_for(t, "MODE", "itinerary")
-        items = itinerary_for(t) if m == "itinerary" else watched_huts(t)
-        log(f"   • {t}: " + (" → ".join(items) if m == "itinerary"
-                             else f"{len(items)} 个住宿点（任意空位）"))
-    _need = {}
-    for _t, _, _legs in targets():
-        _need.setdefault(_t, set()).update(d for _, d in _legs)
-    log(f"   模式: {'整条齐了才叫' if wc.REQUIRE_FULL_ITINERARY else '任意一晚有空就叫'}"
-        f" | 间隔 {wc.POLL_SECONDS}s | 每轮 {sum(len(windows(v)) for v in _need.values())} 次请求")
+    describe_watchlist()
 
     cycle = 0
     fails = 0            # 连续失败轮数
     warned = False       # 已经就"连续失败"报过警了吗
+    sig = watchlist_signature()
     try:
         while True:
             cycle += 1
+            new_sig = watchlist_signature()
+            if new_sig != sig:
+                sig = new_sig
+                log("📝 关注清单有改动，已按新清单继续：")
+                describe_watchlist()
             try:
                 daemon = not (args.once or args.status)
                 check_once(state, alert=not args.status,
@@ -871,7 +943,7 @@ def main():
                 break
             nap = wc.POLL_SECONDS * random.uniform(0.75, 1.25)
             log(f"   💤 {nap/60:.1f} 分钟后再查")
-            time.sleep(nap)
+            interruptible_sleep(nap)
     except KeyboardInterrupt:
         log("👋 停止盯梢")
     finally:

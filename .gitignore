@@ -8,3 +8,6 @@ watch.out
 watch.err
 *.png
 __pycache__/
+
+# 管理界面用来同步云端的 GitHub token，绝不能提交
+github_token.txt

@@ -1,0 +1,25 @@
+{
+  "updated": "2026-09-26T22:26:29",
+  "entries": [
+    {
+      "id": "e6c918",
+      "track": "Milford Track",
+      "from": "2027-02-10",
+      "to": "2027-04-28",
+      "people": 1,
+      "enabled": true,
+      "auto_reserve": true,
+      "huts_only": false
+    },
+    {
+      "id": "430792",
+      "track": "Routeburn Track",
+      "from": "2027-02-10",
+      "to": "2027-04-29",
+      "people": 1,
+      "enabled": true,
+      "auto_reserve": false,
+      "huts_only": false
+    }
+  ]
+}
