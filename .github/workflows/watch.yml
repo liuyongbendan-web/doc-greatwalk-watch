@@ -32,12 +32,11 @@ jobs:
           key: gw-state-${{ github.run_id }}
           restore-keys: gw-state-
 
+      # Tracks, dates and party size come from watchlist.json in this repo.
+      # Edit them with the local UI (doc-booking/ui_server.py); it commits here on save.
       - name: Check availability
         env:
           GW_WEBHOOK_URL: ${{ secrets.GW_WEBHOOK_URL }}
-          GW_TRACK: "Milford Track,Routeburn Track"
-          GW_DATE_RANGE: "2027-02-10,2027-04-30"
-          GW_PEOPLE: "1"
         run: |
           if [ -z "$GW_WEBHOOK_URL" ]; then
             echo "::error::Repository secret GW_WEBHOOK_URL is not set."
