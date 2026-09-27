@@ -157,9 +157,15 @@ def save_state(state):
 
 
 def write_heartbeat(**kv):
-    """每轮写一次心跳，供 --health / --watchdog 判断死活"""
-    hb = {"ts": time.time(), "iso": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-          "pid": os.getpid(), "track": tracks_label(), "poll": wc.POLL_SECONDS}
+    """
+    写心跳，供 --health / --watchdog 判断死活。会保留上一次的 ok/fails/cycle，
+    只更新传进来的字段 —— 这样在「检查中」「占位中」也能随时刷新时间戳，
+    而不会把「上轮取数成功」冲掉。
+    """
+    old = read_heartbeat() or {}
+    hb = {k: v for k, v in old.items() if k in ("ok", "fails", "cycle", "error", "phase")}
+    hb.update({"ts": time.time(), "iso": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+               "pid": os.getpid(), "track": tracks_label(), "poll": wc.POLL_SECONDS})
     hb.update(kv)
     try:
         tmp = HEARTBEAT_FILE + ".tmp"
@@ -224,9 +230,12 @@ def entry_dates(entry):
     """一条清单条目的全部出发日（含首尾）"""
     a = datetime.strptime(entry["from"], "%Y-%m-%d")
     b = datetime.strptime(entry["to"], "%Y-%m-%d")
+    skip = set(entry.get("exclude") or [])      # 明确说过不要的出发日
     out = []
     while a <= b:
-        out.append(a.strftime("%Y-%m-%d"))
+        d = a.strftime("%Y-%m-%d")
+        if d not in skip:
+            out.append(d)
         a += timedelta(days=1)
     return out
 
@@ -410,7 +419,74 @@ def send_webhook(hook, title, body, url, track=None):
         urllib.request.Request(hook, data=data, headers=headers), timeout=15)
 
 
-def notify(title, body, url=None, track=None):
+MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+          "August", "September", "October", "November", "December"]
+
+
+def speak_date(d):
+    """'2027-03-11' -> 'March 11'（给 say 朗读用）"""
+    try:
+        return f"{MONTHS[int(d[5:7]) - 1]} {int(d[8:10])}"
+    except Exception:
+        return d
+
+
+def today_key():
+    """「同一天」按墨尔本/悉尼日历算 —— 云端跑在 UTC，不统一的话它会在上午 10 点换天"""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+SENT_FILE = os.path.join(HERE, "notify_sent.json")
+
+
+def _load_sent():
+    try:
+        with open(SENT_FILE) as f:
+            d = json.load(f)
+        if d.get("day") == today_key():
+            return d
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"day": today_key(), "titles": []}
+
+
+def _sent_today(title):
+    return title in _load_sent()["titles"]
+
+
+def _mark_sent(title):
+    d = _load_sent()
+    if title not in d["titles"]:
+        d["titles"].append(title)
+    try:
+        tmp = SENT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, SENT_FILE)
+    except OSError:
+        pass
+
+
+def notify(title, body, url=None, track=None, kind="availability", speech=None):
+    """
+    kind: availability（有票）/ reserve（自动占位结果）/ health（盯梢自身状况）/ test
+    推到手机的规则：
+      云端(CI)   —— 全部推
+      本机       —— 只推 LOCAL_PUSH_KINDS 里的种类（默认只推占位结果）。
+                    有票的提醒由云端推，本机再推一遍就重复了；
+                    但「Mac 上替你占了位、等你付款」只有本机知道，必须推。
+    标题里就放日期 —— macOS 常把通知正文藏起来（预览设为「解锁时显示」），
+    只看得到标题，所以日期不能只写在正文里。
+    """
+    # 同一天、同一条（按标题）只发一次 —— 不管你订没订。测试消息不去重。
+    # 看门狗、常驻盯梢、一次性查询是不同进程，所以记在独立的小文件里共用。
+    if kind != "test" and _sent_today(title):
+        log(f"   🔕 今天已发过同样的通知，不再发：{title}")
+        return
     log(f"🔔 {title} — {body}")
     if wc.NOTIFY_BELL:
         sys.stdout.write("\a" * 3)
@@ -420,19 +496,23 @@ def notify(title, body, url=None, track=None):
                         'display notification "{}" with title "{}" sound name "Glass"'
                         .format(body.replace('"', "'"), title.replace('"', "'"))],
                        capture_output=True)
-    if wc.NOTIFY_SPEAK and sys.platform == "darwin":
-        subprocess.run(["say", "-r", "180",
-                        f"{(track or tracks_label())} has availability. Go book it now."],
+    if wc.NOTIFY_SPEAK and sys.platform == "darwin" and kind != "health":
+        subprocess.run(["say", "-r", "175",
+                        speech or f"{(track or tracks_label())} has availability. Go book it now."],
                        capture_output=True)
-    if wc.WEBHOOK_URL:
+    push_kinds = getattr(wc, "LOCAL_PUSH_KINDS", ("reserve",))
+    hook = getattr(wc, "WEBHOOK_URL", "") or ""
+    if hook and (os.environ.get("CI") or kind in push_kinds or kind == "test"):
         try:
-            send_webhook(wc.WEBHOOK_URL, title, body, url or BOOKING_URL, track)
+            send_webhook(hook, title, body, url or BOOKING_URL, track)
             log("   webhook 已发送")
         except Exception as e:
             log(f"   ⚠️ webhook 失败: {e}")
             globals()["WEBHOOK_FAILED"] = True
-    if wc.OPEN_BROWSER and sys.platform == "darwin":
+    if wc.OPEN_BROWSER and sys.platform == "darwin" and kind == "availability":
         subprocess.run(["open", url or BOOKING_URL], capture_output=True)
+    if kind != "test" and not globals().get("WEBHOOK_FAILED"):
+        _mark_sent(title)
 
 
 # ── 一轮检查 ─────────────────────────────────────────────────
@@ -493,20 +573,66 @@ def summarize_hits(hits, itinerary_mode):
     return "  ".join(parts) if parts else "有空位（详见日志）"
 
 
+def _day_bucket(state, name):
+    """state[name] = {"day": 今天, ...}，换天自动清空"""
+    b = state.get(name)
+    if not isinstance(b, dict) or b.get("day") != today_key():
+        b = {"day": today_key()}
+        state[name] = b
+    return b
+
+
+def _md(d):
+    return f"{int(d[5:7])}/{int(d[8:10])}"
+
+
+def _short(h):
+    return re.sub(r"\s*(Hut|Campsite|Shelter|Bunkroom)\s*$", "", h, flags=re.I)
+
+
+def alert_title(track, hits, itinerary_mode):
+    """标题里直接写日期（见 notify 的说明）"""
+    t = track.replace(" Track", "")
+    full = sorted({x[0] for x in hits if x[4]}) if itinerary_mode else []
+    if full:
+        ds = "、".join(_md(d) for d in full[:3]) + (f" 等{len(full)}个" if len(full) > 3 else "")
+        return f"🎉 {t} 整条有票：{ds} 出发"
+    nights = sorted({(x[2], _short(x[1])) for x in hits})
+    ds = "、".join(f"{_md(d)} {h}" for d, h in nights[:2]) + (f" 等{len(nights)}处" if len(nights) > 2 else "")
+    return f"✨ {t} 单晚有位：{ds}"
+
+
+def alert_speech(track, hits, itinerary_mode):
+    full = sorted({x[0] for x in hits if x[4]}) if itinerary_mode else []
+    if full:
+        return f"{track}: full trip available, departing {speak_date(full[0])}" + \
+               (f", and {len(full) - 1} more dates." if len(full) > 1 else ".")
+    d = sorted({x[2] for x in hits})[0]
+    return f"{track}: a single night available on {speak_date(d)}."
+
+
 def check_once(state, alert=True, verbose=False, allow_reserve=False):
-    """allow_reserve 只有常驻循环才传 True。
-    --once / --status / --table 是人工查询或 CI 巡检，绝不能顺手下单。"""
+    """
+    allow_reserve 只有常驻循环才传 True —— --once / --status / --table 绝不下单。
+
+    提醒规则（按天去重）：同一天里，同一个「整条可订的出发日」或同一个「单晚空位」
+    只提醒一次；只有出现**新的日期**才再提醒，而且只列新出现的那些。
+    整条可订提醒过之后，它包含的那几晚也算提醒过，不会再以「单晚」重复报。
+    """
     tgts = targets()
     if not tgts:
         log("   清单为空（或全部停用），本轮无事可做")
         return False
     grid, nreq = fetch_all(needed_dates(tgts))
 
-    now = time.time()
-    counts, last_alert = state["counts"], state["last_alert"]
+    alerted = _day_bucket(state, "alerted")
+    alerted.setdefault("keys", [])
+    done = set(alerted["keys"])
+    counts = state.setdefault("counts", {})
     hits_by_track = {}                 # 线路 -> [(标签, 住宿点, 日期, 余量, 整组命中, 条目)]
+    full_now = []                      # 本轮所有整条可订（给自动占位用，不受提醒去重影响）
+    still_known = {}                   # 线路 -> 今天已提醒过、此刻仍有位的出发日数
     interesting_lines = []
-    seen_keys = set()                  # 同一个 hut-night 一轮只报一次
     n_open = n_closed = 0
     multi = len(watched_tracks()) > 1
 
@@ -520,7 +646,8 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
         people = entry.get("people", 1)
         avail = [(h, d, n) for h, d, n in leg_state
                  if isinstance(n, int) and n >= people]
-        full = len(avail) == len(legs)
+        full = bool(legs) and len(avail) == len(legs)
+        itinerary_mode = watchlist.mode_for(track) == "itinerary"
 
         if avail or verbose:
             mark = "🎉" if full else ("✨" if avail else "  ")
@@ -530,22 +657,32 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
             prefix = f"[{track.replace(' Track', '')}] " if multi else ""
             interesting_lines.append(f" {mark} {prefix}{label} 出发 | {detail}")
 
-        if not alert:
+        if full and itinerary_mode:
+            full_now.append((track, label, entry))
+        if not alert or not avail:
             continue
-        if cfg_for(track, "REQUIRE_FULL_ITINERARY", False) and not full:
+
+        if full and itinerary_mode:
+            fkey = f"{track}|FULL|{label}"
+            if fkey in done:
+                still_known[track] = still_known.get(track, 0) + 1
+                continue
+            for h, d, n in avail:
+                hits_by_track.setdefault(track, []).append((label, h, d, n, True, entry))
+            done.add(fkey)
+            done.update(f"{track}|{h}|{d}" for h, d, _ in avail)
+            continue
+
+        if cfg_for(track, "REQUIRE_FULL_ITINERARY", False) and itinerary_mode:
             continue
         for h, d, n in avail:
             key = f"{track}|{h}|{d}"
-            if key in seen_keys:
+            if key in done:
                 continue
-            prev = counts.get(key)
-            fresh = prev in (None, 0) or (isinstance(prev, int) and n > prev)
-            cooled = now - last_alert.get(key, 0) > wc.REALERT_MINUTES * 60
-            if fresh or cooled:
-                hits_by_track.setdefault(track, []).append((label, h, d, n, full, entry))
-                seen_keys.add(key)
-                last_alert[key] = now
+            hits_by_track.setdefault(track, []).append((label, h, d, n, full, entry))
+            done.add(key)
 
+    alerted["keys"] = sorted(done)
     for (track, h, d), n in grid.items():
         counts[f"{track}|{h}|{d}"] = n
 
@@ -553,24 +690,33 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
         log(ln)
     if not interesting_lines:
         log(f"   {nreq} 次请求 | {len(grid)} 个格子 | 开放 {n_open} / 季外 {n_closed} | 全部无票")
+    elif not hits_by_track and alert:
+        log("   （都是今天提醒过的，不重复提醒）")
 
-    # 每条线路单独发一条通知，标题里就带线路名，不会混在一起
     for track, hits in hits_by_track.items():
-        full_hit = any(x[4] for x in hits)
         itinerary_mode = watchlist.mode_for(track) == "itinerary"
-        title = (f"🎉 {track} 整条行程有票！" if full_hit and itinerary_mode
-                 else f"✨ {track} 有空位")
-        notify(title, summarize_hits([x[:5] for x in hits], itinerary_mode), track=track)
+        body = summarize_hits([x[:5] for x in hits], itinerary_mode)
+        if still_known.get(track):
+            body += f"  （另有 {still_known[track]} 个今天已提醒过的出发日仍可订）"
+        notify(alert_title(track, hits, itinerary_mode), body, track=track,
+               speech=alert_speech(track, hits, itinerary_mode))
 
-        # 自动占位：总开关（本机 AUTO_RESERVE，云端强制关）+ 该条目自己的开关
-        if not (full_hit and wc.AUTO_RESERVE and allow_reserve and itinerary_mode):
-            continue
-        armed = [x for x in hits if x[4] and x[5].get("auto_reserve")]
-        if armed:
-            first = armed[0]
-            auto_reserve(track, first[0], first[5].get("people", 1))
-        else:
-            log(f"   ⏭  {track} 命中的条目没开自动占位，只报警不下单")
+    # 自动占位：看的是「此刻整条可订」，不管今天提醒过没有；
+    # 同一出发日一天最多成功占 1 次、最多尝试 2 次（你没付款就说明不想要，别反复锁别人的位）
+    if allow_reserve and wc.AUTO_RESERVE:
+        tries = _day_bucket(state, "reserve").setdefault("tries", {})
+        for track, label, entry in full_now:
+            if not entry.get("auto_reserve"):
+                continue
+            k = f"{track}|{label}"
+            t = tries.get(k, {"attempts": 0, "success": False})
+            if t["success"] or t["attempts"] >= 2:
+                continue
+            t["attempts"] += 1
+            r = auto_reserve(track, label, entry.get("people", 1))
+            t["success"] = bool(r.get("reserved"))
+            tries[k] = t
+            break                        # 一轮只占一个，占完再说
     return bool(hits_by_track)
 
 
@@ -626,19 +772,32 @@ def print_table():
 
 # ── 自动占位（可选，需要 playwright）──────────────────────────
 
-async def hold_browser_open(minutes=30):
-    """占位成功后别关浏览器。后台运行（无 tty）时不能用 input()，否则会立刻 EOFError。"""
+async def hold_for_payment(page, browser, minutes=25):
+    """
+    占住后把窗口留给你付款。每 30 秒写一次心跳 —— 以前这 30 分钟里主循环不写心跳，
+    看门狗以为进程死了，15:05 把它连同付款窗口一起杀掉（2026-09-27）。
+    你关掉窗口、或 25 分钟购物车过期，就结束。
+    """
     import asyncio
-    if sys.stdin and sys.stdin.isatty():
-        print("浏览器保持打开，按 Enter 关闭...")
-        await asyncio.get_event_loop().run_in_executor(None, input)
-    else:
-        log(f"   🕒 后台模式：浏览器保持打开 {minutes} 分钟，快去付款")
-        await asyncio.sleep(minutes * 60)
+    end = time.time() + minutes * 60
+    log(f"   🕒 窗口留给你付款，最多 {minutes} 分钟（关掉窗口即结束）")
+    while time.time() < end:
+        write_heartbeat(phase="holding", hold_left_min=round((end - time.time()) / 60, 1))
+        if page.is_closed() or not browser.is_connected():
+            log("   🪟 付款窗口已被关闭，结束等待")
+            return
+        await asyncio.sleep(30)
+    log("   ⌛ 25 分钟到了，购物车应已过期，关闭窗口")
 
 
 def auto_reserve(track, start_date, people=1):
+    """
+    登录 → 搜索 → 选格子 → Reserve → 填表 → Book Great Walk → **核对购物车**。
+    返回 {"reserved": 是否锁住了位子, "cart": 购物车条数, "error": 错误}。
+    """
+    result = {"reserved": False, "cart": 0, "error": None}
     log(f"🤖 AUTO_RESERVE: 尝试占位 {track} {start_date} ...")
+    write_heartbeat(phase="reserving")
     try:
         import asyncio
         from playwright.async_api import async_playwright
@@ -646,60 +805,91 @@ def auto_reserve(track, start_date, people=1):
         import config
     except Exception as e:
         log(f"   ⚠️ 缺少 playwright / book.py，跳过自动占位: {e}")
-        return
+        result["error"] = str(e)
+        return result
     itin = itinerary_for(track)
     config.GREAT_WALK = track
     config.START_DATE = start_date
     config.NUM_PEOPLE = people
     config.NUM_NIGHTS = len(itin)
+    shots = os.path.join(HERE, "reserve_shots")
+    os.makedirs(shots, exist_ok=True)
+    stamp = datetime.now().strftime("%m%d-%H%M%S")
+    md = lambda d: f"{int(d[5:7])}/{int(d[8:10])}"
+
+    async def snap(page, name):
+        try:
+            await page.screenshot(path=os.path.join(shots, f"{stamp}-{name}.png"), full_page=True)
+        except Exception:
+            pass
 
     async def run():
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False, slow_mo=60)
-            ctx = await browser.new_context(viewport={"width": 1280, "height": 900},
+            ctx = await browser.new_context(viewport={"width": 1400, "height": 900},
                                             locale="en-NZ", timezone_id="Pacific/Auckland")
             page = await ctx.new_page()
             try:
                 await page.goto("https://bookings.doc.govt.nz/Web/#!greatwalk-result",
                                 wait_until="domcontentloaded")
+                await book.show_banner(page, f"🤖 自动占位进行中：{track} {start_date} 出发 —— 请不要关闭这个窗口")
                 await book.login(page)
+                write_heartbeat(phase="reserving")
                 await book.fill_search_form(page)
                 ok = await book.select_huts(page, datetime.strptime(start_date, "%Y-%m-%d"), itin)
                 if not ok and await book.occupant_modal_open(page):
-                    # 兜底：即使上面判定失败，只要 Occupant Details 弹窗真的开着，
-                    # 就说明位置已经 Reserve 住了，必须继续填表，不能白白放走
-                    log("   ℹ️ select_huts 报失败，但弹窗是开着的 —— 继续填表")
+                    log("   ℹ️ select_huts 报失败，但弹窗是开着的 —— 位子已锁，继续填表")
                     ok = True
-                if ok:
-                    log("   ✅ Reserve 成功，25 分钟倒计时开始，继续填表…")
-                    try:
-                        await book.fill_occupant_details(page)
-                        await book.book_great_walk(page)
-                        await page.wait_for_timeout(2500)
-                        try:                       # 停在购物车页面，方便直接付款
-                            await page.click("#shopping-cart", timeout=5000)
-                            await page.wait_for_timeout(3000)
-                        except Exception:
-                            pass
-                        log("   🛒 已加入购物车，请在这个浏览器窗口里完成付款")
-                    except Exception as e:
-                        log(f"   ⚠️ 填表/加购物车出错，但位置已 Reserve 住了: {e}")
+                await snap(page, "1-reserve")
+                if not ok:
+                    result["error"] = "Reserve 没成功（可能被别人先抢了）"
+                    return
+                result["reserved"] = True
+                log("   ✅ Reserve 成功，位子已锁 25 分钟，继续填表…")
+                write_heartbeat(phase="reserving")
+                filled = await book.fill_occupant_details(page)
+                await snap(page, "2-occupant")
+                if filled:
+                    await book.book_great_walk(page)
+                n, left = await book.cart_status(page)
+                await snap(page, "3-cart")
+                result["cart"] = n
+                if n:
+                    log(f"   🛒 购物车核对：{n} 条，剩余 {left or '?'}")
+                    await book.show_banner(page, f"🤖 已替你占位 {track} {start_date} 出发（{n} 晚）"
+                                                 f"—— 请在这个窗口付款，剩余 {left or '约 25 分钟'}")
+                else:
+                    log("   ⚠️ 购物车是空的 —— 位子锁住了但没进购物车，需要你在窗口里手动完成")
+                    await book.show_banner(page, "🤖 位子已锁但没进购物车 —— 请在这个窗口里手动完成填表和付款")
 
-                # ⚠️ 购物车绑「浏览器会话」不绑账号（2026-08-23 实测）：
-                #    换个浏览器/手机登录同一账号是看不到这个购物车的，
-                #    所以必须在这个弹出的窗口里付款，且窗口不能关。
-                notify(f"{track} 占位{'成功' if ok else '失败'}", 
-                       ("已 Reserve 并加入购物车，25 分钟内付款。"
-                        "⚠️ 必须在弹出的那个浏览器窗口里付款——换设备登录看不到这个购物车！")
-                       if ok else "占位失败，请手动抢", track=track)
-                await hold_browser_open()
+                title = (f"🤖 已占位 {track.replace(' Track','')} {md(start_date)} 出发，去付款！"
+                         if n else f"⚠️ {track.replace(' Track','')} {md(start_date)} 已锁位但需你手动完成")
+                body = ("位子锁 25 分钟。⚠️ 必须在 Mac 上弹出的那个浏览器窗口里付款——"
+                        "换设备登录看不到这个购物车。") if n else \
+                       "Reserve 成功但没能自动加进购物车。去 Mac 上那个窗口里手动填表、付款，25 分钟内有效。"
+                notify(title, body, track=track, kind="reserve",
+                       speech=f"{track} reserved, departing {speak_date(start_date)}. "
+                              f"Please pay on the Mac within 25 minutes.")
+                await hold_for_payment(page, browser)
             except Exception as e:
-                log(f"   ⚠️ 占位出错: {e}")
-                await hold_browser_open()
+                result["error"] = f"{type(e).__name__}: {e}"
+                log(f"   ⚠️ 占位出错: {result['error'][:200]}")
+                await snap(page, "error")
+                if result["reserved"] and not page.is_closed():
+                    await hold_for_payment(page, browser)   # 位子锁着就别白白放掉
             finally:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     asyncio.run(run())
+    if not result["reserved"]:
+        notify(f"⚠️ {track.replace(' Track','')} {md(start_date)} 自动占位没成功",
+               f"原因：{result['error'] or '未知'}。票可能还在，去手动抢。", track=track,
+               kind="reserve", speech=f"Auto reserve for {track} failed. Please book manually.")
+    write_heartbeat(phase="checking")
+    return result
 
 
 # ── 主循环 ───────────────────────────────────────────────────
@@ -830,7 +1020,7 @@ def watchdog():
     log(f"🐕 watchdog: 重启{'成功' if restarted else '失败: ' + (r.stderr or '').strip()}")
     notify(f"🚨 {tracks_label()} 盯梢曾经停止",
            ("看门狗已自动重启它，盯梢已恢复。" if restarted
-            else "看门狗尝试重启失败，需要你手动处理！") + f" 详情：{summary}")
+            else "看门狗尝试重启失败，需要你手动处理！") + f" 详情：{summary}", kind="health")
     return 0 if restarted else 1
 
 
@@ -846,7 +1036,7 @@ def daily_ping(state):
     state["last_ping"] = today
     n = len(state.get("counts", {}))
     notify(f"👀 {tracks_label()} 盯梢正常",
-           f"今日已检查 {n} 个住宿点-日期，暂无空位。盯梢运行中。")
+           f"今日已检查 {n} 个住宿点-日期，暂无空位。盯梢运行中。", kind="health")
 
 
 def main():
@@ -871,9 +1061,10 @@ def main():
     if args.test_notify:
         if not wc.WEBHOOK_URL:
             log("⚠️ watch_config.py 里 WEBHOOK_URL 还是空的，只会走本机通知")
-        notify(f"🎉 {tracks_label()} 整条行程有票！",
+        notify("🎉 Milford 整条有票：2/14 出发（测试）",
                "【这是测试消息，不是真的有票】"
-               "Clinton Hut 2027-02-14 余1; Mintaro Hut 2027-02-15 余1; Dumpling Hut 2027-02-16 余2")
+               "Clinton Hut 2027-02-14 余1; Mintaro Hut 2027-02-15 余1; Dumpling Hut 2027-02-16 余2",
+               kind="test", speech="Test. Milford Track available, departing February 14.")
         return
 
     if args.table:
@@ -904,6 +1095,7 @@ def main():
                 sig = new_sig
                 log("📝 关注清单有改动，已按新清单继续：")
                 describe_watchlist()
+            write_heartbeat(phase="checking")     # 一开始就写，查询/占位再久也不会被看门狗误杀
             try:
                 daemon = not (args.once or args.status)
                 check_once(state, alert=not args.status,
@@ -915,9 +1107,9 @@ def main():
                     save_state(state)
                 if fails >= MAX_SILENT_FAILURES:
                     notify(f"✅ {tracks_label()} 盯梢已恢复",
-                           f"连续失败 {fails} 轮后恢复正常，继续盯梢中")
+                           f"连续失败 {fails} 轮后恢复正常，继续盯梢中", kind="health")
                 fails, warned = 0, False
-                write_heartbeat(cycle=cycle, ok=True, fails=0)
+                write_heartbeat(cycle=cycle, ok=True, fails=0, phase="sleeping")
                 daily_ping(state)
             except Throttled as e:
                 fails += 1
@@ -934,7 +1126,7 @@ def main():
                 warned = True
                 notify(f"🚨 {tracks_label()} 盯梢出问题了",
                        f"连续 {fails} 轮取不到数据，现在的「无票」不可信，请检查。"
-                       f"命令：cd {HERE} && python3 watch.py --health")
+                       f"命令：cd {HERE} && python3 watch.py --health", kind="health")
 
             if args.once or args.status:
                 if args.once and WEBHOOK_FAILED:

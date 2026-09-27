@@ -8,8 +8,11 @@
       "to": "2027-04-28",
       "people": 1,
       "enabled": true,
-      "auto_reserve": true,
-      "huts_only": false
+      "auto_reserve": false,
+      "huts_only": false,
+      "exclude": [
+        "2027-03-11"
+      ]
     },
     {
       "id": "430792",

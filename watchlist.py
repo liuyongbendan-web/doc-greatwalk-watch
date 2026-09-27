@@ -102,6 +102,7 @@ def validate(data):
             "enabled": bool(raw.get("enabled", True)),
             "auto_reserve": bool(raw.get("auto_reserve", False)),
             "huts_only": bool(raw.get("huts_only", False)),
+            "exclude": raw.get("exclude") or [],
         }
         eid = e["id"]
         try:
@@ -137,6 +138,23 @@ def validate(data):
         except (TypeError, ValueError):
             errors.append({"id": eid, "field": "people", "msg": f"人数 1~{MAX_PEOPLE}"})
             e["people"] = 1
+
+        ex = e["exclude"]
+        if isinstance(ex, str):
+            ex = [x for x in ex.replace("，", ",").split(",")]
+        good, bad = [], []
+        for x in ex:
+            x = str(x).strip()
+            if not x:
+                continue
+            try:
+                good.append(datetime.strptime(x, "%Y-%m-%d").strftime("%Y-%m-%d"))
+            except ValueError:
+                bad.append(x)
+        if bad:
+            errors.append({"id": eid, "field": "exclude",
+                           "msg": f"排除日期格式不对：{'、'.join(bad)}（要 YYYY-MM-DD）"})
+        e["exclude"] = sorted(set(good))
 
         if mode_for(e["track"]) != "itinerary":
             e["auto_reserve"] = False          # 任意空位模式没有「整条行程」可占
