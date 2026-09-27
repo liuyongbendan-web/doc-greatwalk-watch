@@ -1,5 +1,5 @@
 {
-  "updated": "2026-09-26T22:26:29",
+  "updated": "2026-09-27T11:28:18",
   "entries": [
     {
       "id": "e6c918",
@@ -17,7 +17,7 @@
       "from": "2027-02-10",
       "to": "2027-04-29",
       "people": 1,
-      "enabled": true,
+      "enabled": false,
       "auto_reserve": false,
       "huts_only": false
     }
