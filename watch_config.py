@@ -56,7 +56,12 @@ NOTIFY_MACOS   = True    # macOS 通知中心 + 提示音
 NOTIFY_SPEAK   = True    # 用 say 朗读（睡觉时能叫醒你）
 NOTIFY_BELL    = True    # 终端响铃
 OPEN_BROWSER   = True    # 命中时自动用默认浏览器打开 DOC 预订页
-WEBHOOK_URL    = ""      # 手机推送：ntfy / Discord / Slack 的 webhook，自动适配格式
+WEBHOOK_URL    = ""      # 云端用 GW_WEBHOOK_URL secret
+
+# 本机推到手机的消息种类。有票提醒由云端推（每 15 分钟），本机再推会重复；
+# 但「Mac 上替你占了位、等你付款」只有本机知道，必须推。
+#   "availability" 有票 / "reserve" 自动占位结果 / "health" 盯梢自身故障
+LOCAL_PUSH_KINDS = ("reserve",)
 
 # --- 自动占位只允许抢这个日期范围（出发日）---
 # None = 整个 WATCH_DATE_RANGE 都能抢
@@ -76,3 +81,6 @@ AUTO_RESERVE_TRACKS = ["Milford Track"]
 # 需要 config.py 里的 EMAIL / PASSWORD 正确，且本机装了 playwright
 # ⚠️ 目前只对 Milford Track + itinerary 模式生效（book.py 的行程逻辑是按 Milford 写的）
 AUTO_RESERVE = True
+
+# --- 云端仓库（管理界面保存时把 watchlist.json 同步到这里）---
+CLOUD_REPO = "liuyongbendan-web/doc-greatwalk-watch"
