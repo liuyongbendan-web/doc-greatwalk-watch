@@ -1,14 +1,14 @@
 {
-  "updated": "2026-09-27T15:40:29",
+  "updated": "2026-10-12T22:49:51",
   "entries": [
     {
       "id": "e6c918",
       "track": "Milford Track",
-      "from": "2026-10-21",
+      "from": "2026-11-02",
       "to": "2027-02-04",
       "people": 1,
       "enabled": true,
-      "auto_reserve": true,
+      "auto_reserve": false,
       "huts_only": false,
       "exclude": []
     },
