@@ -55,7 +55,7 @@ DAILY_PING_HOUR = 9
 NOTIFY_MACOS   = True    # macOS 通知中心 + 提示音
 NOTIFY_SPEAK   = True    # 用 say 朗读（睡觉时能叫醒你）
 NOTIFY_BELL    = True    # 终端响铃
-OPEN_BROWSER   = True    # 命中时自动用默认浏览器打开 DOC 预订页
+OPEN_BROWSER   = False   # 命中时不再自动打开网页，只发通知
 WEBHOOK_URL    = ""      # 云端用 GW_WEBHOOK_URL secret
 
 # 本机推到手机的消息种类。有票提醒由云端推（每 15 分钟），本机再推会重复；

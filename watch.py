@@ -611,6 +611,35 @@ def alert_speech(track, hits, itinerary_mode):
     return f"{track}: a single night available on {speak_date(d)}."
 
 
+LAST_STATUS = None
+STATUS_FILE = os.path.join(HERE, "status.json")
+
+
+def write_status_file():
+    """给手机 Artifact 看的状态。字段尽量小：每条清单最多列 60 个整条可订日 / 40 个单晚日期。"""
+    if LAST_STATUS is None:
+        return
+    now = datetime.now()
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Australia/Melbourne"))
+    except Exception:
+        pass
+    ents = {}
+    for eid, st in LAST_STATUS.items():
+        singles = [{"date": d, "huts": v[:4]} for d, v in sorted(st["single"].items())]
+        ents[eid] = {"full": st["full"][:60], "full_count": len(st["full"]),
+                     "partial": st["partial"], "single": singles[:40],
+                     "single_count": len(singles)}
+    out = {"generated_at": now.strftime("%Y-%m-%dT%H:%M:%S"), "source": "cloud",
+           "entries": ents}
+    tmp = STATUS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+    os.replace(tmp, STATUS_FILE)
+
+
 def check_once(state, alert=True, verbose=False, allow_reserve=False):
     """
     allow_reserve 只有常驻循环才传 True —— --once / --status / --table 绝不下单。
@@ -625,6 +654,7 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
         return False
     grid, nreq = fetch_all(needed_dates(tgts))
 
+    status = {}                        # 条目 id -> 给手机 Artifact 看的状态
     alerted = _day_bucket(state, "alerted")
     alerted.setdefault("keys", [])
     done = set(alerted["keys"])
@@ -657,6 +687,16 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
             prefix = f"[{track.replace(' Track', '')}] " if multi else ""
             interesting_lines.append(f" {mark} {prefix}{label} 出发 | {detail}")
 
+        st = status.setdefault(entry.get("id", track), {"full": [], "partial": 0, "single": {}})
+        if itinerary_mode:
+            if full:
+                st["full"].append({"date": label, "legs": [{"hut": h, "n": n} for h, _, n in avail]})
+            elif avail:
+                st["partial"] += 1
+        else:
+            for h, d, n in avail:
+                st["single"].setdefault(d, []).append({"hut": h, "n": n})
+
         if full and itinerary_mode:
             full_now.append((track, label, entry))
         if not alert or not avail:
@@ -683,6 +723,7 @@ def check_once(state, alert=True, verbose=False, allow_reserve=False):
             done.add(key)
 
     alerted["keys"] = sorted(done)
+    globals()["LAST_STATUS"] = status
     for (track, h, d), n in grid.items():
         counts[f"{track}|{h}|{d}"] = n
 
@@ -1090,6 +1131,12 @@ def main():
     try:
         while True:
             cycle += 1
+            if not (args.once or args.status):
+                changed, note = watchlist.pull()          # 手机/云端改过清单就拉下来
+                if changed:
+                    log(f"☁️  从 GitHub 拉到新清单（{note}）")
+                elif "出错" in note or "分叉" in note:
+                    log(f"   ⚠️ 清单同步：{note}")
             new_sig = watchlist_signature()
             if new_sig != sig:
                 sig = new_sig
@@ -1128,6 +1175,11 @@ def main():
                        f"连续 {fails} 轮取不到数据，现在的「无票」不可信，请检查。"
                        f"命令：cd {HERE} && python3 watch.py --health", kind="health")
 
+            if args.once and os.environ.get("CI"):
+                try:
+                    write_status_file()
+                except Exception as e:
+                    log(f"   ⚠️ 写 status.json 失败（不影响检查）：{e}")
             if args.once or args.status:
                 if args.once and WEBHOOK_FAILED:
                     log("❌ 查到了空位但推送没发出去 —— 这次等于白跑，用非零退出码让工作流变红")
