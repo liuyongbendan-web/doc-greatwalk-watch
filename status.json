@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-11-02T09:45:39",
+ "generated_at": "2026-11-02T10:00:55",
  "source": "cloud",
  "entries": {
   "e6c918": {
@@ -9,7 +9,7 @@
      "legs": [
       {
        "hut": "Clinton Hut",
-       "n": 2
+       "n": 1
       },
       {
        "hut": "Mintaro Hut",
