@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-11-06T11:01:00",
+ "generated_at": "2026-11-06T11:15:40",
  "source": "cloud",
  "entries": {
   "e6c918": {
@@ -20,9 +20,26 @@
        "n": 1
       }
      ]
+    },
+    {
+     "date": "2027-01-31",
+     "legs": [
+      {
+       "hut": "Clinton Hut",
+       "n": 1
+      },
+      {
+       "hut": "Mintaro Hut",
+       "n": 1
+      },
+      {
+       "hut": "Dumpling Hut",
+       "n": 1
+      }
+     ]
     }
    ],
-   "full_count": 1,
+   "full_count": 2,
    "partial": 0,
    "single": [],
    "single_count": 0
