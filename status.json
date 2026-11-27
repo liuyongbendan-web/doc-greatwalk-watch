@@ -1,29 +1,11 @@
 {
- "generated_at": "2026-11-27T16:45:40",
+ "generated_at": "2026-11-27T17:15:41",
  "source": "cloud",
  "entries": {
   "e6c918": {
-   "full": [
-    {
-     "date": "2026-12-12",
-     "legs": [
-      {
-       "hut": "Clinton Hut",
-       "n": 1
-      },
-      {
-       "hut": "Mintaro Hut",
-       "n": 1
-      },
-      {
-       "hut": "Dumpling Hut",
-       "n": 1
-      }
-     ]
-    }
-   ],
-   "full_count": 1,
-   "partial": 0,
+   "full": [],
+   "full_count": 0,
+   "partial": 1,
    "single": [],
    "single_count": 0
   }
